@@ -49,6 +49,13 @@ export function createServer() {
 
     try {
       await adapter.init()
+
+      const loginOk = await adapter.login()
+      if (!loginOk) {
+        res.status(401).json({ success: false, error: 'Login failed. Check credentials.' })
+        return
+      }
+
       const result = await adapter.scrapeAppointments()
 
       const response: ScrapeAppointmentsResponse = {
