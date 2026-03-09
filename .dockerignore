@@ -1,0 +1,8 @@
+node_modules
+dist
+storage/sessions/*
+storage/artifacts/*
+!storage/sessions/.gitkeep
+!storage/artifacts/.gitkeep
+.git
+*.md
