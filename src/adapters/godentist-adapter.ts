@@ -97,7 +97,7 @@ export class GoDentistAdapter {
       await passwordField.click()
       await passwordField.fill(this.credentials.password)
 
-      // Select first sucursal (required by validation)
+      // Select first sucursal (required by login validation)
       const sucursalSelect = await this.page.$('#login-form select') || await this.page.$('select')
       if (sucursalSelect) {
         const options = await sucursalSelect.$$('option')
@@ -111,8 +111,6 @@ export class GoDentistAdapter {
           }
         }
       }
-
-      await this.takeScreenshot('login-filled')
 
       const submitBtn = await this.page.$('#login-form button[type="submit"]')
         || await this.page.$('button[type="submit"]')
@@ -153,16 +151,16 @@ export class GoDentistAdapter {
     }
   }
 
-  // ── Scrape: diagnostic version to discover page controls ──
+  // ── Scrape All Sucursales ──
 
   async scrapeAppointments(): Promise<{ date: string; appointments: Appointment[]; errors: string[] }> {
     if (!this.page) throw new Error('Browser not initialized')
 
     const targetDate = this.getNextWorkingDay()
-    const dateStr = this.formatDateForInput(targetDate)
-    const dateLabel = targetDate.toISOString().split('T')[0]
+    const dateStr = this.formatDateDD_MM_YYYY(targetDate)
+    const dateLabel = this.formatDateYYYY_MM_DD(targetDate)
 
-    console.log(`[GoDentist] Target date: ${dateLabel}`)
+    console.log(`[GoDentist] Target date: ${dateLabel} (${dateStr})`)
 
     const allAppointments: Appointment[] = []
     const errors: string[] = []
@@ -170,92 +168,284 @@ export class GoDentistAdapter {
     // Navigate to appointments page
     await this.page.goto(APPOINTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 })
     await this.page.waitForTimeout(2000)
-    await this.takeScreenshot('citas-page')
 
-    // ── DIAGNOSTIC: Log ALL selects, inputs, and buttons on the page ──
-    const diagnostics = await this.page.evaluate(() => {
-      const result: Record<string, unknown[]> = { selects: [], inputs: [], buttons: [] }
+    // Step 1: Set date filter (DD-MM-YYYY format for ExtJS)
+    await this.setDate(dateStr)
 
-      document.querySelectorAll('select').forEach((sel, i) => {
-        const opts = Array.from(sel.options).map(o => ({ value: o.value, text: o.text.trim() }))
-        result.selects.push({
-          index: i,
-          id: sel.id,
-          name: sel.name,
-          className: sel.className,
-          optionCount: opts.length,
-          options: opts.slice(0, 15), // first 15 options
-        })
-      })
+    // Step 2: Set hour to 6:00 am (earliest)
+    await this.setHour('6:00 am')
 
-      document.querySelectorAll('input').forEach((inp, i) => {
-        result.inputs.push({
-          index: i,
-          type: inp.type,
-          id: inp.id,
-          name: inp.name,
-          className: inp.className,
-          placeholder: inp.placeholder,
-          value: inp.value,
-        })
-      })
+    // Step 3: Discover sucursales from the ExtJS combo
+    const sucursales = await this.discoverSucursales()
+    console.log(`[GoDentist] Found ${sucursales.length} sucursales: ${sucursales.map(s => s.label).join(', ')}`)
 
-      document.querySelectorAll('button, input[type="submit"]').forEach((btn, i) => {
-        result.buttons.push({
-          index: i,
-          tag: btn.tagName,
-          type: (btn as HTMLButtonElement).type,
-          id: btn.id,
-          className: btn.className,
-          text: btn.textContent?.trim().substring(0, 50),
-        })
-      })
-
-      return result
-    })
-
-    console.log('[GoDentist] ── PAGE DIAGNOSTICS ──')
-    console.log(`[GoDentist] SELECTS (${(diagnostics.selects as unknown[]).length}):`)
-    for (const sel of diagnostics.selects as Array<Record<string, unknown>>) {
-      console.log(`  [${sel.index}] id="${sel.id}" name="${sel.name}" class="${sel.className}" options=${sel.optionCount}`)
-      const opts = sel.options as Array<{ value: string; text: string }>
-      for (const opt of opts) {
-        console.log(`    - value="${opt.value}" text="${opt.text}"`)
+    if (sucursales.length === 0) {
+      // If we can't discover, just scrape current view
+      console.log('[GoDentist] No sucursales discovered, scraping current view...')
+      await this.clickBuscar()
+      await this.page.waitForTimeout(3000)
+      const currentSucursal = await this.page.$eval('#ext-comp-1051', el => (el as HTMLInputElement).value).catch(() => 'Desconocida')
+      const appointments = await this.extractAppointments(currentSucursal)
+      allAppointments.push(...appointments)
+      if (appointments.length === 0) {
+        errors.push('No se pudieron descubrir sucursales ni extraer citas')
       }
-    }
-    console.log(`[GoDentist] INPUTS (${(diagnostics.inputs as unknown[]).length}):`)
-    for (const inp of diagnostics.inputs as Array<Record<string, unknown>>) {
-      console.log(`  [${inp.index}] type="${inp.type}" id="${inp.id}" name="${inp.name}" class="${inp.className}" placeholder="${inp.placeholder}" value="${inp.value}"`)
-    }
-    console.log(`[GoDentist] BUTTONS (${(diagnostics.buttons as unknown[]).length}):`)
-    for (const btn of diagnostics.buttons as Array<Record<string, unknown>>) {
-      console.log(`  [${btn.index}] <${btn.tag}> type="${btn.type}" id="${btn.id}" text="${btn.text}"`)
+      return { date: dateLabel, appointments: allAppointments, errors }
     }
 
-    // Also log table headers
-    const headers = await this.page.locator('table thead th, table thead td').allTextContents()
-    console.log(`[GoDentist] TABLE HEADERS: ${headers.map(h => h.trim()).join(' | ')}`)
+    // Step 4: Iterate each sucursal
+    for (const sucursal of sucursales) {
+      try {
+        console.log(`[GoDentist] ── Sucursal: ${sucursal.label} ──`)
+        await this.selectSucursal(sucursal)
+        await this.clickBuscar()
+        await this.page.waitForTimeout(3000)
+        await this.takeScreenshot(`citas-${sucursal.label.replace(/\s+/g, '-').toLowerCase()}`)
 
-    const rowCount = await this.page.locator('table tbody tr').count()
-    console.log(`[GoDentist] TABLE ROWS: ${rowCount}`)
-
-    if (rowCount > 0) {
-      const firstRowCells = await this.page.locator('table tbody tr').first().locator('td').allTextContents()
-      console.log(`[GoDentist] FIRST ROW: ${firstRowCells.map((c, i) => `[${i}]="${c.trim()}"`).join(', ')}`)
-    }
-
-    // Return diagnostic info as errors so we can see it in the response
-    errors.push(`DIAGNOSTIC: ${(diagnostics.selects as unknown[]).length} selects, ${(diagnostics.inputs as unknown[]).length} inputs, ${(diagnostics.buttons as unknown[]).length} buttons, ${rowCount} table rows`)
-    errors.push(`SELECTS: ${JSON.stringify(diagnostics.selects)}`)
-    errors.push(`INPUTS: ${JSON.stringify(diagnostics.inputs)}`)
-    errors.push(`HEADERS: ${headers.map(h => h.trim()).join(' | ')}`)
-
-    if (rowCount > 0) {
-      const firstRowCells = await this.page.locator('table tbody tr').first().locator('td').allTextContents()
-      errors.push(`FIRST_ROW: ${firstRowCells.map((c, i) => `[${i}]="${c.trim()}"`).join(', ')}`)
+        const appointments = await this.extractAppointments(sucursal.label)
+        allAppointments.push(...appointments)
+        console.log(`[GoDentist] ${sucursal.label}: ${appointments.length} citas`)
+      } catch (err) {
+        const msg = `Error en ${sucursal.label}: ${err instanceof Error ? err.message : String(err)}`
+        console.error(`[GoDentist] ${msg}`)
+        errors.push(msg)
+      }
     }
 
     return { date: dateLabel, appointments: allAppointments, errors }
+  }
+
+  // ── ExtJS Form Controls ──
+
+  private async setDate(dateStr: string): Promise<void> {
+    if (!this.page) return
+    // #df_fecha is a text input with DD-MM-YYYY format
+    const dateInput = this.page.locator('#df_fecha')
+    await dateInput.click({ clickCount: 3 }) // select all
+    await dateInput.fill(dateStr)
+    await dateInput.press('Tab') // trigger ExtJS change event
+    console.log(`[GoDentist] Date set: ${dateStr}`)
+  }
+
+  private async setHour(hour: string): Promise<void> {
+    if (!this.page) return
+    // Set both the hidden field and the visible combo
+    await this.page.evaluate((h) => {
+      const hidden = document.getElementById('idhoras') as HTMLInputElement
+      if (hidden) hidden.value = h
+    }, hour)
+
+    // Click and type in the visible hour field
+    const hourInput = this.page.locator('#ext-comp-1089')
+    const exists = await hourInput.count()
+    if (exists > 0) {
+      await hourInput.click({ clickCount: 3 })
+      await hourInput.fill(hour)
+      await hourInput.press('Tab')
+      console.log(`[GoDentist] Hour set: ${hour}`)
+    }
+  }
+
+  private async discoverSucursales(): Promise<Sucursal[]> {
+    if (!this.page) return []
+
+    try {
+      // The sucursal combo is #ext-comp-1051 — it's an ExtJS ComboBox
+      // Click the trigger arrow to open the dropdown list
+      const comboInput = this.page.locator('#ext-comp-1051')
+      const exists = await comboInput.count()
+      if (exists === 0) {
+        console.error('[GoDentist] Sucursal combo #ext-comp-1051 not found')
+        return []
+      }
+
+      // Click the trigger button (arrow) next to the combo to open dropdown
+      // ExtJS combos have a sibling trigger element
+      const trigger = this.page.locator('#ext-comp-1051').locator('..').locator('.x-form-trigger')
+      const triggerExists = await trigger.count()
+
+      if (triggerExists > 0) {
+        await trigger.click()
+      } else {
+        // Fallback: click the input itself
+        await comboInput.click()
+      }
+
+      await this.page.waitForTimeout(1000)
+      await this.takeScreenshot('sucursal-dropdown-open')
+
+      // ExtJS dropdown items appear in a floating div with class x-combo-list or x-layer
+      // Items are usually in div.x-combo-list-item
+      const items = this.page.locator('.x-combo-list-item')
+      const count = await items.count()
+      console.log(`[GoDentist] Dropdown items found: ${count}`)
+
+      if (count === 0) {
+        // Try alternative selectors for ExtJS dropdown
+        const altItems = this.page.locator('.x-combo-list .x-combo-list-inner div')
+        const altCount = await altItems.count()
+        console.log(`[GoDentist] Alt dropdown items: ${altCount}`)
+
+        if (altCount === 0) {
+          // Log what's visible for debugging
+          const floatingDivs = await this.page.evaluate(() => {
+            const divs = document.querySelectorAll('.x-layer, .x-combo-list, [style*="visibility: visible"]')
+            return Array.from(divs).map(d => ({
+              tag: d.tagName,
+              className: d.className,
+              childCount: d.children.length,
+              text: d.textContent?.substring(0, 200),
+            }))
+          })
+          console.log(`[GoDentist] Floating divs: ${JSON.stringify(floatingDivs)}`)
+          return []
+        }
+
+        const sucursales: Sucursal[] = []
+        for (let i = 0; i < altCount; i++) {
+          const text = (await altItems.nth(i).textContent())?.trim() || ''
+          if (text && !text.toLowerCase().includes('seleccione')) {
+            sucursales.push({ value: text, label: text })
+          }
+        }
+        // Close dropdown
+        await this.page.keyboard.press('Escape')
+        return sucursales
+      }
+
+      const sucursales: Sucursal[] = []
+      for (let i = 0; i < count; i++) {
+        const text = (await items.nth(i).textContent())?.trim() || ''
+        if (text && !text.toLowerCase().includes('seleccione')) {
+          sucursales.push({ value: text, label: text })
+        }
+      }
+
+      // Close dropdown by pressing Escape
+      await this.page.keyboard.press('Escape')
+      await this.page.waitForTimeout(300)
+
+      return sucursales
+    } catch (err) {
+      console.error('[GoDentist] Error discovering sucursales:', err)
+      return []
+    }
+  }
+
+  private async selectSucursal(sucursal: Sucursal): Promise<void> {
+    if (!this.page) return
+
+    // Open the dropdown
+    const trigger = this.page.locator('#ext-comp-1051').locator('..').locator('.x-form-trigger')
+    const triggerExists = await trigger.count()
+
+    if (triggerExists > 0) {
+      await trigger.click()
+    } else {
+      await this.page.locator('#ext-comp-1051').click()
+    }
+
+    await this.page.waitForTimeout(800)
+
+    // Click the matching item
+    const item = this.page.locator(`.x-combo-list-item:has-text("${sucursal.label}")`)
+    const exists = await item.count()
+    if (exists > 0) {
+      await item.click()
+      console.log(`[GoDentist] Sucursal selected: ${sucursal.label}`)
+    } else {
+      // Fallback: set value directly
+      await this.page.evaluate((label) => {
+        const input = document.getElementById('ext-comp-1051') as HTMLInputElement
+        if (input) input.value = label
+      }, sucursal.label)
+      await this.page.keyboard.press('Escape')
+      console.log(`[GoDentist] Sucursal set via JS: ${sucursal.label}`)
+    }
+
+    await this.page.waitForTimeout(500)
+  }
+
+  private async clickBuscar(): Promise<void> {
+    if (!this.page) return
+
+    // Look for search/filter button
+    const searchBtn = await this.page.$('button:has-text("Buscar")')
+      || await this.page.$('button:has-text("Filtrar")')
+      || await this.page.$('button:has-text("Consultar")')
+      || await this.page.$('button[type="submit"]')
+
+    if (searchBtn) {
+      await searchBtn.click()
+      console.log('[GoDentist] Buscar clicked')
+    } else {
+      // ExtJS may use a toolbar button — try pressing Enter on the date field
+      await this.page.locator('#df_fecha').press('Enter')
+      console.log('[GoDentist] Enter pressed on date field')
+    }
+  }
+
+  // ── Data Extraction ──
+
+  private async extractAppointments(sucursal: string): Promise<Appointment[]> {
+    if (!this.page) return []
+    const appointments: Appointment[] = []
+
+    try {
+      await this.page.waitForSelector('table', { timeout: 10000 })
+
+      // Get all table rows
+      const rows = this.page.locator('table tbody tr')
+      const rowCount = await rows.count()
+      console.log(`[GoDentist] Table rows: ${rowCount}`)
+
+      for (let i = 0; i < rowCount; i++) {
+        const row = rows.nth(i)
+        const cells = await row.locator('td').allTextContents()
+        const cleanCells = cells.map(c => c.trim()).filter(c => c.length > 0)
+
+        if (cleanCells.length < 3) continue // Skip separator/empty rows
+
+        // Table headers: Hora | Paciente | Estado | Teléfono | Doctor | Tipo | E | C | Comentarios
+        // Parse based on known column structure
+        let hora = ''
+        let nombre = ''
+        let telefono = ''
+
+        for (const cell of cleanCells) {
+          // Time pattern: H:MM AM/PM or HH:MM
+          const timeMatch = cell.match(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\b/)
+          if (timeMatch && !hora) {
+            hora = timeMatch[1].trim()
+            continue
+          }
+
+          // Phone: 10+ digits or 3XX Colombian mobile
+          const phoneMatch = cell.match(/(\+?\d{10,}|\b3\d{9}\b)/)
+          if (phoneMatch && !telefono) {
+            telefono = phoneMatch[1].replace(/\D/g, '')
+            if (telefono.length === 10 && telefono.startsWith('3')) {
+              telefono = '57' + telefono
+            }
+            continue
+          }
+
+          // Name: alphabetic, > 3 chars, has spaces (full names)
+          if (!nombre && cell.length > 3 && /[a-zA-ZáéíóúñÁÉÍÓÚÑ]/.test(cell) && cell.includes(' ') && !/^\d+$/.test(cell)) {
+            nombre = cell
+          }
+        }
+
+        if (nombre && telefono) {
+          appointments.push({ nombre, telefono, hora, sucursal })
+        }
+      }
+    } catch (err) {
+      console.error(`[GoDentist] Extraction error (${sucursal}):`, err)
+      await this.takeScreenshot(`extraction-error`)
+    }
+
+    return appointments
   }
 
   // ── Date Helpers ──
@@ -265,13 +455,27 @@ export class GoDentistAdapter {
     const colombiaTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Bogota' }))
     const next = new Date(colombiaTime)
     next.setDate(next.getDate() + 1)
-    while (next.getDay() === 0) {
+
+    // Skip Sunday (0). If Saturday (6), skip to Monday
+    if (next.getDay() === 0) {
       next.setDate(next.getDate() + 1)
+    } else if (next.getDay() === 6) {
+      next.setDate(next.getDate() + 2)
     }
+
     return next
   }
 
-  private formatDateForInput(date: Date): string {
+  /** DD-MM-YYYY format for the ExtJS date input */
+  private formatDateDD_MM_YYYY(date: Date): string {
+    const day = String(date.getDate()).padStart(2, '0')
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const year = date.getFullYear()
+    return `${day}-${month}-${year}`
+  }
+
+  /** YYYY-MM-DD for the API response */
+  private formatDateYYYY_MM_DD(date: Date): string {
     const year = date.getFullYear()
     const month = String(date.getMonth() + 1).padStart(2, '0')
     const day = String(date.getDate()).padStart(2, '0')
