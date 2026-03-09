@@ -72,16 +72,17 @@ export class GoDentistAdapter {
     await this.takeScreenshot('login-page')
 
     try {
-      // Wait for login form fields
-      await this.page.waitForSelector('input[name="username"], input[name="usuario"], input[type="text"]', { timeout: 10000 })
+      // GoDentist form uses class-based selectors, not name attributes
+      // Fields: input.username (text), input.password (password), select for sucursal
+      await this.page.waitForSelector('#login-form, input.username, input[type="text"]', { timeout: 10000 })
 
-      // Try to find username/password fields
-      const usernameField = await this.page.$('input[name="username"]')
-        || await this.page.$('input[name="usuario"]')
+      // Find username field — prefer .username class, fallback to type=text
+      const usernameField = await this.page.$('input.username')
+        || await this.page.$('#login-form input[type="text"]')
         || await this.page.$('input[type="text"]')
 
-      const passwordField = await this.page.$('input[name="password"]')
-        || await this.page.$('input[name="clave"]')
+      const passwordField = await this.page.$('input.password')
+        || await this.page.$('#login-form input[type="password"]')
         || await this.page.$('input[type="password"]')
 
       if (!usernameField || !passwordField) {
@@ -90,41 +91,84 @@ export class GoDentistAdapter {
         return false
       }
 
+      // Fill credentials
+      await usernameField.click()
       await usernameField.fill(this.credentials.username)
+      await passwordField.click()
       await passwordField.fill(this.credentials.password)
+
+      // Select sucursal from dropdown (REQUIRED by login form validation)
+      const sucursalSelect = await this.page.$('#login-form select')
+        || await this.page.$('select')
+      if (sucursalSelect) {
+        // Get available options
+        const options = await sucursalSelect.$$('option')
+        const optionValues: Array<{ value: string; text: string }> = []
+        for (const opt of options) {
+          const val = await opt.getAttribute('value')
+          const text = (await opt.textContent())?.trim() || ''
+          if (val && val !== '' && val !== '0' && !text.toLowerCase().includes('seleccione')) {
+            optionValues.push({ value: val, text })
+          }
+        }
+        console.log(`[GoDentist] Sucursales available: ${optionValues.map(o => `${o.text}(${o.value})`).join(', ')}`)
+
+        if (optionValues.length > 0) {
+          // Select first sucursal (login just needs any valid selection)
+          await sucursalSelect.selectOption(optionValues[0].value)
+          console.log(`[GoDentist] Selected sucursal: ${optionValues[0].text}`)
+        }
+      } else {
+        console.warn('[GoDentist] No sucursal dropdown found on login form')
+      }
+
       await this.takeScreenshot('login-filled')
 
       // Find and click submit button
-      const submitBtn = await this.page.$('button[type="submit"]')
+      const submitBtn = await this.page.$('#login-form button[type="submit"]')
+        || await this.page.$('button[type="submit"]')
         || await this.page.$('input[type="submit"]')
+        || await this.page.$('#login-form button')
         || await this.page.$('button:has-text("Ingresar")')
         || await this.page.$('button:has-text("Entrar")')
-        || await this.page.$('button:has-text("Login")')
 
       if (submitBtn) {
         await submitBtn.click()
+        console.log('[GoDentist] Submit button clicked')
       } else {
-        // Try pressing Enter on the password field
         await passwordField.press('Enter')
+        console.log('[GoDentist] Enter pressed on password field')
       }
 
+      // Wait for navigation or response
       await this.page.waitForTimeout(5000)
       await this.takeScreenshot('after-login')
 
-      // Verify login success - check we're no longer on login page
+      // Verify login success
       const postLoginUrl = this.page.url()
+      const pageContent = await this.page.content()
       const loginSuccess = postLoginUrl !== currentUrl
         || postLoginUrl.includes('/dashboard')
         || postLoginUrl.includes('/inicio')
         || postLoginUrl.includes('/citas')
+        || !pageContent.includes('login-form')
 
       if (loginSuccess) {
-        console.log('[GoDentist] Login successful')
+        console.log(`[GoDentist] Login successful — URL: ${postLoginUrl}`)
         await this.saveCookies()
         return true
       }
 
-      console.error('[GoDentist] Login failed - still on login page')
+      // Log any visible error messages for debugging
+      const errorText = await this.page.$eval(
+        '.error, .alert-danger, .validation-error, .formError, .errormessage',
+        el => el.textContent?.trim() || ''
+      ).catch(() => '')
+      if (errorText) {
+        console.error(`[GoDentist] Login error message: ${errorText}`)
+      }
+
+      console.error(`[GoDentist] Login failed — URL stayed: ${postLoginUrl}`)
       await this.takeScreenshot('login-failed')
       return false
     } catch (err) {
