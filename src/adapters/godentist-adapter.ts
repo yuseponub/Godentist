@@ -4,16 +4,18 @@ import * as path from 'path'
 import type { Credentials, Appointment } from '../types/index.js'
 
 const STORAGE_DIR = path.resolve('storage')
-const SESSIONS_DIR = path.join(STORAGE_DIR, 'sessions')
 const ARTIFACTS_DIR = path.join(STORAGE_DIR, 'artifacts')
 
 const BASE_URL = 'https://godentist.dentos.co'
 const APPOINTMENTS_URL = `${BASE_URL}/citas/index/listcitassimple`
 
+interface Sucursal {
+  value: string
+  label: string
+}
+
 export class GoDentistAdapter {
   private browser: Browser | null = null
-  private context: BrowserContext | null = null
-  private page: Page | null = null
   private credentials: Credentials
   private workspaceId: string
 
@@ -30,64 +32,88 @@ export class GoDentistAdapter {
       headless: true,
       args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu'],
     })
-    this.context = await this.browser.newContext({
-      viewport: { width: 1280, height: 720 },
-    })
-    this.page = await this.context.newPage()
-    await this.loadCookies()
     console.log('[GoDentist] Browser ready')
   }
 
   async close(): Promise<void> {
     try {
-      if (this.page) await this.page.close()
-      if (this.context) await this.context.close()
       if (this.browser) await this.browser.close()
     } catch (err) {
       console.error('[GoDentist] Error closing browser:', err)
     }
-    this.page = null
-    this.context = null
     this.browser = null
     console.log('[GoDentist] Browser closed')
   }
 
-  // ── Login ──
+  private async newPage(): Promise<{ context: BrowserContext; page: Page }> {
+    if (!this.browser) throw new Error('Browser not initialized')
+    const context = await this.browser.newContext({
+      viewport: { width: 1280, height: 720 },
+    })
+    const page = await context.newPage()
+    return { context, page }
+  }
 
-  async login(): Promise<boolean> {
-    if (!this.page) throw new Error('Browser not initialized')
+  // ── Discover Sucursales from Login Page ──
 
-    console.log('[GoDentist] Navigating to login...')
-    await this.page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30000 })
-    await this.page.waitForTimeout(2000)
+  async discoverSucursales(): Promise<Sucursal[]> {
+    const { context, page } = await this.newPage()
+    try {
+      await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30000 })
+      await page.waitForTimeout(2000)
 
-    // Check if already logged in (redirected to dashboard or has session)
-    const currentUrl = this.page.url()
-    if (currentUrl.includes('/dashboard') || currentUrl.includes('/inicio')) {
+      const sucursalSelect = await page.$('#login-form select') || await page.$('select')
+      if (!sucursalSelect) {
+        console.error('[GoDentist] No sucursal dropdown found on login page')
+        await this.takeScreenshotPage(page, 'no-sucursal-select')
+        return []
+      }
+
+      const options = await sucursalSelect.$$('option')
+      const sucursales: Sucursal[] = []
+      for (const opt of options) {
+        const val = await opt.getAttribute('value')
+        const text = (await opt.textContent())?.trim() || ''
+        if (val && val !== '' && val !== '0' && !text.toLowerCase().includes('seleccione')) {
+          sucursales.push({ value: val, label: text })
+        }
+      }
+
+      console.log(`[GoDentist] Sucursales: ${sucursales.map(s => s.label).join(', ')}`)
+      return sucursales
+    } finally {
+      await context.close()
+    }
+  }
+
+  // ── Login selecting a specific sucursal ──
+
+  async loginWithSucursal(page: Page, sucursalValue: string): Promise<boolean> {
+    console.log(`[GoDentist] Logging in with sucursal ${sucursalValue}...`)
+    await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 30000 })
+    await page.waitForTimeout(2000)
+
+    // Check if already past login
+    const currentUrl = page.url()
+    if (currentUrl.includes('/dashboard') || currentUrl.includes('/inicio') || currentUrl.includes('/citas')) {
       console.log('[GoDentist] Already logged in')
-      await this.saveCookies()
       return true
     }
 
-    await this.takeScreenshot('login-page')
-
     try {
-      // GoDentist form uses class-based selectors, not name attributes
-      // Fields: input.username (text), input.password (password), select for sucursal
-      await this.page.waitForSelector('#login-form, input.username, input[type="text"]', { timeout: 10000 })
+      await page.waitForSelector('#login-form, input.username, input[type="text"]', { timeout: 10000 })
 
-      // Find username field — prefer .username class, fallback to type=text
-      const usernameField = await this.page.$('input.username')
-        || await this.page.$('#login-form input[type="text"]')
-        || await this.page.$('input[type="text"]')
+      const usernameField = await page.$('input.username')
+        || await page.$('#login-form input[type="text"]')
+        || await page.$('input[type="text"]')
 
-      const passwordField = await this.page.$('input.password')
-        || await this.page.$('#login-form input[type="password"]')
-        || await this.page.$('input[type="password"]')
+      const passwordField = await page.$('input.password')
+        || await page.$('#login-form input[type="password"]')
+        || await page.$('input[type="password"]')
 
       if (!usernameField || !passwordField) {
         console.error('[GoDentist] Could not find login form fields')
-        await this.takeScreenshot('login-fields-missing')
+        await this.takeScreenshotPage(page, 'login-fields-missing')
         return false
       }
 
@@ -97,385 +123,221 @@ export class GoDentistAdapter {
       await passwordField.click()
       await passwordField.fill(this.credentials.password)
 
-      // Select sucursal from dropdown (REQUIRED by login form validation)
-      const sucursalSelect = await this.page.$('#login-form select')
-        || await this.page.$('select')
+      // Select the target sucursal
+      const sucursalSelect = await page.$('#login-form select') || await page.$('select')
       if (sucursalSelect) {
-        // Get available options
-        const options = await sucursalSelect.$$('option')
-        const optionValues: Array<{ value: string; text: string }> = []
-        for (const opt of options) {
-          const val = await opt.getAttribute('value')
-          const text = (await opt.textContent())?.trim() || ''
-          if (val && val !== '' && val !== '0' && !text.toLowerCase().includes('seleccione')) {
-            optionValues.push({ value: val, text })
-          }
-        }
-        console.log(`[GoDentist] Sucursales available: ${optionValues.map(o => `${o.text}(${o.value})`).join(', ')}`)
-
-        if (optionValues.length > 0) {
-          // Select first sucursal (login just needs any valid selection)
-          await sucursalSelect.selectOption(optionValues[0].value)
-          console.log(`[GoDentist] Selected sucursal: ${optionValues[0].text}`)
-        }
-      } else {
-        console.warn('[GoDentist] No sucursal dropdown found on login form')
+        await sucursalSelect.selectOption(sucursalValue)
       }
 
-      await this.takeScreenshot('login-filled')
+      await this.takeScreenshotPage(page, `login-filled-${sucursalValue}`)
 
-      // Find and click submit button
-      const submitBtn = await this.page.$('#login-form button[type="submit"]')
-        || await this.page.$('button[type="submit"]')
-        || await this.page.$('input[type="submit"]')
-        || await this.page.$('#login-form button')
-        || await this.page.$('button:has-text("Ingresar")')
-        || await this.page.$('button:has-text("Entrar")')
+      // Submit
+      const submitBtn = await page.$('#login-form button[type="submit"]')
+        || await page.$('button[type="submit"]')
+        || await page.$('input[type="submit"]')
+        || await page.$('#login-form button')
+        || await page.$('button:has-text("Ingresar")')
 
       if (submitBtn) {
         await submitBtn.click()
-        console.log('[GoDentist] Submit button clicked')
-      } else {
+      } else if (passwordField) {
         await passwordField.press('Enter')
-        console.log('[GoDentist] Enter pressed on password field')
       }
 
-      // Wait for navigation or response
-      await this.page.waitForTimeout(5000)
-      await this.takeScreenshot('after-login')
+      await page.waitForTimeout(5000)
+      await this.takeScreenshotPage(page, `after-login-${sucursalValue}`)
 
-      // Verify login success
-      const postLoginUrl = this.page.url()
-      const pageContent = await this.page.content()
-      const loginSuccess = postLoginUrl !== currentUrl
+      // Verify login — check URL changed or login form gone
+      const postLoginUrl = page.url()
+      const pageContent = await page.content()
+      const success = postLoginUrl !== currentUrl
         || postLoginUrl.includes('/dashboard')
         || postLoginUrl.includes('/inicio')
         || postLoginUrl.includes('/citas')
         || !pageContent.includes('login-form')
 
-      if (loginSuccess) {
-        console.log(`[GoDentist] Login successful — URL: ${postLoginUrl}`)
-        await this.saveCookies()
+      if (success) {
+        console.log(`[GoDentist] Login OK for sucursal ${sucursalValue} — URL: ${postLoginUrl}`)
         return true
       }
 
-      // Log any visible error messages for debugging
-      const errorText = await this.page.$eval(
-        '.error, .alert-danger, .validation-error, .formError, .errormessage',
-        el => el.textContent?.trim() || ''
-      ).catch(() => '')
-      if (errorText) {
-        console.error(`[GoDentist] Login error message: ${errorText}`)
-      }
-
-      console.error(`[GoDentist] Login failed — URL stayed: ${postLoginUrl}`)
-      await this.takeScreenshot('login-failed')
+      console.error(`[GoDentist] Login failed for sucursal ${sucursalValue}`)
+      await this.takeScreenshotPage(page, `login-failed-${sucursalValue}`)
       return false
     } catch (err) {
       console.error('[GoDentist] Login error:', err)
-      await this.takeScreenshot('login-error')
+      await this.takeScreenshotPage(page, 'login-error')
       return false
     }
   }
 
-  // ── Scrape Appointments ──
+  // ── Main: Scrape All Sucursales ──
 
   async scrapeAppointments(): Promise<{ date: string; appointments: Appointment[]; errors: string[] }> {
-    if (!this.page) throw new Error('Browser not initialized')
-
     const targetDate = this.getNextWorkingDay()
     const dateStr = this.formatDateForInput(targetDate)
     const dateLabel = targetDate.toISOString().split('T')[0]
 
-    console.log(`[GoDentist] Scraping appointments for ${dateLabel}...`)
+    console.log(`[GoDentist] Target date: ${dateLabel}`)
 
     const allAppointments: Appointment[] = []
     const errors: string[] = []
 
-    // Navigate to appointments page
-    await this.page.goto(APPOINTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 })
-    await this.page.waitForTimeout(2000)
-    await this.takeScreenshot('appointments-page')
-
-    // Discover available branches (sucursales)
-    const branches = await this.discoverBranches()
-    console.log(`[GoDentist] Found ${branches.length} branches: ${branches.map(b => b.label).join(', ')}`)
-
-    if (branches.length === 0) {
-      errors.push('No se encontraron sucursales en el dropdown')
+    // Step 1: Discover sucursales from login dropdown
+    const sucursales = await this.discoverSucursales()
+    if (sucursales.length === 0) {
+      errors.push('No se encontraron sucursales en el login')
       return { date: dateLabel, appointments: allAppointments, errors }
     }
 
-    // Iterate through each branch
-    for (const branch of branches) {
+    // Step 2: For each sucursal, login → navigate to citas → scrape
+    for (const sucursal of sucursales) {
+      const { context, page } = await this.newPage()
       try {
-        console.log(`[GoDentist] Scraping branch: ${branch.label}...`)
-        const branchAppointments = await this.scrapeBranch(branch, dateStr, dateLabel)
-        allAppointments.push(...branchAppointments)
-        console.log(`[GoDentist] Branch ${branch.label}: ${branchAppointments.length} appointments`)
+        console.log(`[GoDentist] ── Sucursal: ${sucursal.label} ──`)
+
+        const loggedIn = await this.loginWithSucursal(page, sucursal.value)
+        if (!loggedIn) {
+          errors.push(`Login fallido para sucursal ${sucursal.label}`)
+          continue
+        }
+
+        // Navigate to appointments
+        await page.goto(APPOINTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 })
+        await page.waitForTimeout(2000)
+        await this.takeScreenshotPage(page, `citas-${sucursal.value}`)
+
+        // Set date filter if available
+        await this.setDateFilter(page, dateStr)
+
+        // Extract appointments from the table
+        const appointments = await this.extractAppointments(page, sucursal.label)
+        allAppointments.push(...appointments)
+        console.log(`[GoDentist] ${sucursal.label}: ${appointments.length} citas`)
+
       } catch (err) {
-        const errorMsg = `Error scraping branch ${branch.label}: ${err instanceof Error ? err.message : String(err)}`
-        console.error(`[GoDentist] ${errorMsg}`)
-        errors.push(errorMsg)
-        await this.takeScreenshot(`error-branch-${branch.value}`)
+        const msg = `Error en sucursal ${sucursal.label}: ${err instanceof Error ? err.message : String(err)}`
+        console.error(`[GoDentist] ${msg}`)
+        errors.push(msg)
+        await this.takeScreenshotPage(page, `error-${sucursal.value}`)
+      } finally {
+        await context.close()
       }
     }
 
     return { date: dateLabel, appointments: allAppointments, errors }
   }
 
-  // ── Branch Discovery ──
+  // ── Date Filter on Appointments Page ──
 
-  private async discoverBranches(): Promise<Array<{ value: string; label: string }>> {
-    if (!this.page) return []
-
-    try {
-      // Look for branch/sucursal dropdown
-      const selectLocator = this.page.locator('select[name*="sucursal"], select[name*="sede"], select[name*="branch"], select[id*="sucursal"], select[id*="sede"]')
-      const selectCount = await selectLocator.count()
-
-      if (selectCount === 0) {
-        // Try to find any select element and check its options
-        const allSelects = this.page.locator('select')
-        const count = await allSelects.count()
-        console.log(`[GoDentist] No branch select found by name, checking ${count} selects...`)
-
-        for (let i = 0; i < count; i++) {
-          const select = allSelects.nth(i)
-          const options = await select.locator('option').allTextContents()
-          console.log(`[GoDentist] Select ${i}: ${options.join(', ')}`)
-        }
-
-        await this.takeScreenshot('no-branch-select')
-        return []
-      }
-
-      const select = selectLocator.first()
-      const options = await select.locator('option').all()
-      const branches: Array<{ value: string; label: string }> = []
-
-      for (const option of options) {
-        const value = await option.getAttribute('value')
-        const label = (await option.textContent())?.trim() || ''
-        // Skip empty/placeholder options
-        if (value && value !== '' && value !== '0' && label && !label.toLowerCase().includes('seleccione') && !label.toLowerCase().includes('todos')) {
-          branches.push({ value, label })
-        }
-      }
-
-      return branches
-    } catch (err) {
-      console.error('[GoDentist] Error discovering branches:', err)
-      await this.takeScreenshot('branch-discovery-error')
-      return []
-    }
-  }
-
-  // ── Scrape Single Branch ──
-
-  private async scrapeBranch(
-    branch: { value: string; label: string },
-    dateStr: string,
-    dateLabel: string
-  ): Promise<Appointment[]> {
-    if (!this.page) return []
-
-    // Navigate fresh to appointments page for each branch
-    await this.page.goto(APPOINTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 })
-    await this.page.waitForTimeout(1500)
-
-    // 1. Select branch
-    const branchSelect = this.page.locator('select[name*="sucursal"], select[name*="sede"], select[name*="branch"], select[id*="sucursal"], select[id*="sede"]').first()
-    await branchSelect.selectOption(branch.value)
-    await this.page.waitForTimeout(500)
-
-    // 2. Set date to next working day
-    await this.setDateField(dateStr)
-
-    // 3. Set time to minimum (5:00 AM)
-    await this.setTimeField('05:00')
-
-    await this.takeScreenshot(`branch-${branch.value}-configured`)
-
-    // 4. Submit/search
-    await this.clickSearch()
-    await this.page.waitForTimeout(3000)
-    await this.takeScreenshot(`branch-${branch.value}-results`)
-
-    // 5. Extract appointments from results table
-    const appointments = await this.extractAppointments(branch.label)
-
-    return appointments
-  }
-
-  // ── Form Helpers ──
-
-  private async setDateField(dateStr: string): Promise<void> {
-    if (!this.page) return
-
-    // Try various date input selectors
-    const dateInput = this.page.locator('input[type="date"], input[name*="fecha"], input[id*="fecha"]').first()
+  private async setDateFilter(page: Page, dateStr: string): Promise<void> {
+    // Look for date input on the citas page
+    const dateInput = page.locator('input[type="date"], input[name*="fecha"], input[id*="fecha"]').first()
     const exists = await dateInput.count()
 
     if (exists > 0) {
       await dateInput.fill(dateStr)
-      console.log(`[GoDentist] Date set to: ${dateStr}`)
-    } else {
-      console.warn('[GoDentist] Date input not found, trying text input...')
-      // Some systems use text inputs for dates
-      const textInputs = this.page.locator('input[type="text"]')
-      const count = await textInputs.count()
-      for (let i = 0; i < count; i++) {
-        const placeholder = await textInputs.nth(i).getAttribute('placeholder')
-        if (placeholder && (placeholder.includes('fecha') || placeholder.includes('date') || placeholder.includes('dd/mm'))) {
-          await textInputs.nth(i).fill(dateStr)
-          break
-        }
+      console.log(`[GoDentist] Date filter set to: ${dateStr}`)
+
+      // Look for a search/filter button to apply
+      const searchBtn = await page.$('button:has-text("Buscar")')
+        || await page.$('button:has-text("Filtrar")')
+        || await page.$('button:has-text("Consultar")')
+        || await page.$('button[type="submit"]')
+        || await page.$('input[type="submit"]')
+
+      if (searchBtn) {
+        await searchBtn.click()
+        await page.waitForTimeout(3000)
+        console.log('[GoDentist] Search/filter applied')
       }
-    }
-  }
 
-  private async setTimeField(time: string): Promise<void> {
-    if (!this.page) return
-
-    // Try time input or hour dropdown
-    const timeInput = this.page.locator('input[type="time"], input[name*="hora"], select[name*="hora"], select[id*="hora"]').first()
-    const exists = await timeInput.count()
-
-    if (exists > 0) {
-      const tagName = await timeInput.evaluate(el => el.tagName.toLowerCase())
-      if (tagName === 'select') {
-        // Find the earliest option
-        const options = await timeInput.locator('option').all()
-        if (options.length > 0) {
-          const firstValue = await options[0].getAttribute('value')
-          if (firstValue) {
-            await timeInput.selectOption(firstValue)
-            console.log(`[GoDentist] Time set to first option: ${firstValue}`)
-          }
-        }
-      } else {
-        await timeInput.fill(time)
-        console.log(`[GoDentist] Time set to: ${time}`)
-      }
+      await this.takeScreenshotPage(page, 'date-filtered')
     } else {
-      console.warn('[GoDentist] Time input not found')
-    }
-  }
-
-  private async clickSearch(): Promise<void> {
-    if (!this.page) return
-
-    // Try various search/filter buttons
-    const searchBtn = await this.page.$('button:has-text("Buscar")')
-      || await this.page.$('button:has-text("Filtrar")')
-      || await this.page.$('button:has-text("Consultar")')
-      || await this.page.$('button[type="submit"]')
-      || await this.page.$('input[type="submit"]')
-
-    if (searchBtn) {
-      await searchBtn.click()
-      console.log('[GoDentist] Search clicked')
-    } else {
-      console.warn('[GoDentist] Search button not found, trying Enter...')
-      await this.page.keyboard.press('Enter')
+      console.log('[GoDentist] No date input found — using default date shown on page')
     }
   }
 
   // ── Data Extraction ──
 
-  private async extractAppointments(sucursal: string): Promise<Appointment[]> {
-    if (!this.page) return []
-
+  private async extractAppointments(page: Page, sucursal: string): Promise<Appointment[]> {
     const appointments: Appointment[] = []
 
     try {
-      // Wait for results table to appear
-      await this.page.waitForSelector('table, .table, [role="grid"], .data-table', { timeout: 10000 })
+      // Wait for table
+      await page.waitForSelector('table, .table, [role="grid"]', { timeout: 10000 })
 
-      // Try standard HTML table first
-      const rows = this.page.locator('table tbody tr, .table tbody tr')
+      // First, log the table headers so we know column positions
+      const headers = await page.locator('table thead th, table thead td').allTextContents()
+      console.log(`[GoDentist] Table headers: ${headers.map(h => h.trim()).join(' | ')}`)
+
+      const rows = page.locator('table tbody tr')
       const rowCount = await rows.count()
-      console.log(`[GoDentist] Found ${rowCount} table rows`)
+      console.log(`[GoDentist] Table rows: ${rowCount}`)
 
       if (rowCount === 0) {
-        // Try alternative: div-based tables or lists
-        const altRows = this.page.locator('[role="row"], .appointment-row, .cita-row')
-        const altCount = await altRows.count()
-        console.log(`[GoDentist] Alternative rows: ${altCount}`)
-
-        if (altCount === 0) {
-          await this.takeScreenshot(`no-results-${sucursal}`)
-          return []
-        }
-
-        for (let i = 0; i < altCount; i++) {
-          const row = altRows.nth(i)
-          const cells = await row.locator('[role="cell"], td, .cell').allTextContents()
-          const appointment = this.parseAppointmentFromCells(cells, sucursal)
-          if (appointment) appointments.push(appointment)
-        }
-        return appointments
+        await this.takeScreenshotPage(page, `no-rows-${sucursal}`)
+        return []
       }
 
-      // Parse standard table rows
+      // Log first row cells for debugging column mapping
+      if (rowCount > 0) {
+        const firstRowCells = await rows.first().locator('td').allTextContents()
+        console.log(`[GoDentist] First row cells (${firstRowCells.length}): ${firstRowCells.map((c, i) => `[${i}]="${c.trim()}"`).join(', ')}`)
+      }
+
       for (let i = 0; i < rowCount; i++) {
         const row = rows.nth(i)
         const cells = await row.locator('td').allTextContents()
+        const cleanCells = cells.map(c => c.trim())
 
-        if (cells.length < 2) continue // Skip empty or header-like rows
+        if (cleanCells.length < 2) continue
 
-        const appointment = this.parseAppointmentFromCells(cells, sucursal)
+        const appointment = this.parseAppointmentFromCells(cleanCells, sucursal)
         if (appointment) {
           appointments.push(appointment)
         }
       }
     } catch (err) {
-      console.error(`[GoDentist] Error extracting appointments for ${sucursal}:`, err)
-      await this.takeScreenshot(`extraction-error-${sucursal}`)
+      console.error(`[GoDentist] Extraction error (${sucursal}):`, err)
+      await this.takeScreenshotPage(page, `extraction-error-${sucursal}`)
     }
 
     return appointments
   }
 
   private parseAppointmentFromCells(cells: string[], sucursal: string): Appointment | null {
-    // Clean cell values
-    const cleanCells = cells.map(c => c.trim()).filter(c => c.length > 0)
-
+    const cleanCells = cells.filter(c => c.length > 0)
     if (cleanCells.length < 2) return null
 
-    // We need to discover column positions from the data
-    // Look for phone-like patterns (10+ digits) and time-like patterns (HH:MM)
     let nombre = ''
     let telefono = ''
     let hora = ''
 
     for (const cell of cleanCells) {
-      // Phone: 10+ digits, or starts with +57, or 3XX pattern
+      // Phone: 10+ digits, or 3XX pattern (Colombian mobile)
       const phoneMatch = cell.match(/(\+?\d{10,}|\b3\d{9}\b)/)
       if (phoneMatch && !telefono) {
         telefono = phoneMatch[1].replace(/\D/g, '')
-        // Ensure Colombian format
         if (telefono.length === 10 && telefono.startsWith('3')) {
           telefono = '57' + telefono
         }
         continue
       }
 
-      // Time: HH:MM pattern
-      const timeMatch = cell.match(/\b(\d{1,2}:\d{2})\b/)
+      // Time: HH:MM or H:MM AM/PM
+      const timeMatch = cell.match(/\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)\b/)
       if (timeMatch && !hora) {
-        hora = timeMatch[1]
+        hora = timeMatch[1].trim()
         continue
       }
 
-      // Name: text with letters, no digits, reasonable length
+      // Name: letters, reasonable length, not a number
       if (!nombre && cell.length > 2 && /[a-zA-ZáéíóúñÁÉÍÓÚÑ]/.test(cell) && !/^\d+$/.test(cell)) {
         nombre = cell
       }
     }
 
-    // Only return if we have at least a name and phone
     if (nombre && telefono) {
       return { nombre, telefono, hora, sucursal }
     }
@@ -487,7 +349,6 @@ export class GoDentistAdapter {
 
   private getNextWorkingDay(): Date {
     const now = new Date()
-    // Use Colombia timezone
     const colombiaTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Bogota' }))
 
     const next = new Date(colombiaTime)
@@ -508,42 +369,21 @@ export class GoDentistAdapter {
     return `${year}-${month}-${day}`
   }
 
-  // ── Storage Helpers ──
+  // ── Screenshot Helper ──
 
   async takeScreenshot(name: string): Promise<void> {
-    if (!this.page) return
+    // No-op if no active page — used by server.ts error handler
+    console.log(`[GoDentist] takeScreenshot(${name}) — no active page in new architecture`)
+  }
+
+  private async takeScreenshotPage(page: Page, name: string): Promise<void> {
     try {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
       const filePath = path.join(ARTIFACTS_DIR, `${name}-${timestamp}.png`)
-      await this.page.screenshot({ path: filePath, fullPage: true })
+      await page.screenshot({ path: filePath, fullPage: true })
       console.log(`[GoDentist] Screenshot: ${filePath}`)
     } catch (err) {
       console.error(`[GoDentist] Screenshot error:`, err)
-    }
-  }
-
-  private async saveCookies(): Promise<void> {
-    if (!this.context) return
-    try {
-      const cookies = await this.context.cookies()
-      const filePath = path.join(SESSIONS_DIR, `${this.workspaceId}-cookies.json`)
-      fs.writeFileSync(filePath, JSON.stringify(cookies, null, 2))
-    } catch (err) {
-      console.error('[GoDentist] Error saving cookies:', err)
-    }
-  }
-
-  private async loadCookies(): Promise<void> {
-    if (!this.context) return
-    try {
-      const filePath = path.join(SESSIONS_DIR, `${this.workspaceId}-cookies.json`)
-      if (fs.existsSync(filePath)) {
-        const cookies = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-        await this.context.addCookies(cookies)
-        console.log('[GoDentist] Cookies loaded')
-      }
-    } catch (err) {
-      console.error('[GoDentist] Error loading cookies:', err)
     }
   }
 }
